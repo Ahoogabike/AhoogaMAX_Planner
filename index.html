@@ -612,7 +612,8 @@ function saveSettings() {
   cfg.prodtime = parseInt(getVal('cfg-prodtime'))||12;
   cfg.minEmax = parseInt(getVal('cfg-min-emax'))||40;
   cfg.minAmax = parseInt(getVal('cfg-min-amax'))||20;
-  cfg.trackedPOs = getVal('cfg-tracked-pos').split(',').map(s=>s.trim()).filter(Boolean);
+  const tpos = getVal('cfg-tracked-pos').split(',').map(s=>s.trim()).filter(Boolean);
+  if(tpos.length > 0) cfg.trackedPOs = tpos; // only update if field has values
   cfg.decocoatSheetId = getVal('cfg-sheet-id').trim() || '1hsfsJyKJuJjsQcIkYjnE8OQwQqIgEF_cD5d3bPxwVFA';
   cfg.decocoatGid = getVal('cfg-sheet-gid').trim() || '222048185';
   cfg.prefixes.yellow = getVal('cfg-prefix-yellow')||'MAYA';
