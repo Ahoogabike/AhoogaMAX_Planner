@@ -631,8 +631,103 @@ function getVal(id){ return (document.getElementById(id)||{}).value||''; }
 function showAlert(id,msg,type){ const el=document.getElementById(id); if(!el)return; el.innerHTML=`<div class="alert alert-${type}">${msg}</div>`; setTimeout(()=>el.innerHTML='',4000); }
 
 // ─── ODOO ─────────────────────────────────────────────────
-// Cloudflare Worker URL — update this after deploying your worker
+// Cloudflare Worker URL
 const CF_WORKER_URL = 'https://ahooga-planner-proxy.massimiliano-d74.workers.dev';
+
+// ─── SHARED STATE via Cloudflare KV ──────────────────────
+// Keys: shared_cfg, shared_holds, shared_manual, shared_priorities
+const IS_ONLINE = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+
+async function kvGet(key) {
+  if(!IS_ONLINE) return null;
+  try {
+    const r = await fetch(`${CF_WORKER_URL}/store/${encodeURIComponent(key)}`);
+    const text = await r.text();
+    return text === 'null' ? null : JSON.parse(text);
+  } catch(e) { console.warn('KV get failed:', e); return null; }
+}
+
+async function kvSet(key, value) {
+  if(!IS_ONLINE) return;
+  try {
+    await fetch(`${CF_WORKER_URL}/store/${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(value)
+    });
+  } catch(e) { console.warn('KV set failed:', e); }
+}
+
+async function loadSharedState() {
+  if(!IS_ONLINE) return;
+  try {
+    // Load shared config (tracked POs)
+    const sharedCfg = await kvGet('shared_cfg');
+    if(sharedCfg && sharedCfg.trackedPOs) {
+      cfg.trackedPOs = sharedCfg.trackedPOs;
+      cfg.decocoatSheetId = sharedCfg.decocoatSheetId || cfg.decocoatSheetId;
+      cfg.decocoatGid = sharedCfg.decocoatGid || cfg.decocoatGid;
+    }
+
+    // Load shared holds
+    const sharedHolds = await kvGet('shared_holds');
+    if(sharedHolds && Array.isArray(sharedHolds)) {
+      for(const hold of sharedHolds) {
+        const o = [...orders,...manualOrders].find(x=>x.name===hold.name&&x.sku===hold.sku);
+        if(o) { o.status='hold'; o.holdNote=hold.note||''; }
+      }
+    }
+
+    // Load shared manual reservations
+    const sharedManual = await kvGet('shared_manual');
+    if(sharedManual && Array.isArray(sharedManual)) {
+      // Merge: add manual orders not already in local list
+      for(const m of sharedManual) {
+        if(!manualOrders.find(x=>x.id===m.id)) manualOrders.push(m);
+      }
+    }
+
+    // Load shared priorities
+    const sharedPrio = await kvGet('shared_priorities');
+    if(sharedPrio && typeof sharedPrio === 'object') {
+      for(const [soName, priority] of Object.entries(sharedPrio)) {
+        const o = [...orders,...manualOrders].find(x=>x.name===soName);
+        if(o) o.priority = priority;
+      }
+    }
+
+    console.log('[KV] Shared state loaded');
+  } catch(e) { console.warn('loadSharedState failed:', e); }
+}
+
+async function saveSharedState() {
+  if(!IS_ONLINE) return;
+  try {
+    // Save tracked POs and key config
+    await kvSet('shared_cfg', {
+      trackedPOs: cfg.trackedPOs||[],
+      decocoatSheetId: cfg.decocoatSheetId,
+      decocoatGid: cfg.decocoatGid,
+    });
+
+    // Save holds
+    const holds = [...orders,...manualOrders]
+      .filter(o=>o.status==='hold')
+      .map(o=>({name:o.name, sku:o.sku, note:o.holdNote||''}));
+    await kvSet('shared_holds', holds);
+
+    // Save manual reservations
+    await kvSet('shared_manual', manualOrders);
+
+    // Save priority overrides (only non-default)
+    const allSorted = [...orders,...manualOrders].filter(x=>x.status!=='shipped').sort((a,b)=>a.priority-b.priority);
+    const prios = {};
+    allSorted.forEach((o,i)=>{ if(o.priority !== i+1) prios[o.name]=o.priority; });
+    await kvSet('shared_priorities', prios);
+
+    console.log('[KV] Shared state saved');
+  } catch(e) { console.warn('saveSharedState failed:', e); }
+}
 
 function proxyUrl(path) {
   if(window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
@@ -1235,6 +1330,8 @@ async function syncOdoo() {
     assignSerials();
     assignPredictedDeliveries();
     applyDecocoatToOrders();
+    // Load shared state from KV (holds, manual orders, priorities from other users)
+    await loadSharedState();
     save();
     showView('queue');
     // If stock tab was active, refresh it now that vvStock is populated
@@ -1465,6 +1562,7 @@ function moveOrderToPosition(orderId, targetIdx) {
   assignSerials();
   assignPredictedDeliveries();
   save();
+  saveSharedState();
   renderQueue();
   updateKPIs();
 }
@@ -2283,6 +2381,7 @@ function addManualOrder() {
   assignSerials();
   assignPredictedDeliveries();
   save();
+  saveSharedState();
   closeModal('modal-manual');
   renderQueue();
   updateKPIs();
@@ -2295,6 +2394,7 @@ function putOnHold(orderId) {
   matchStockToOrders();
   assignSerials();
   save();
+  saveSharedState();
   renderQueue();
   updateKPIs();
 }
@@ -2306,6 +2406,7 @@ function releaseHold(orderId) {
   matchStockToOrders();
   assignSerials();
   save();
+  saveSharedState();
   renderQueue();
   updateKPIs();
 }
