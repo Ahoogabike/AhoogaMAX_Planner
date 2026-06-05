@@ -906,6 +906,44 @@ async function syncOdoo() {
       [[['id','in',lineIds],['product_uom_qty','>',0],['product_id.categ_id.complete_name','ilike','Bikes']]],
       {fields:['order_id','product_id','product_uom_qty','qty_delivered','name']})) : [];
 
+    // ── 1a. CONFIGURED VARIANT ATTRIBUTES per product (colour / finish / logo…) ──
+    // For custom-colour bikes the chosen options are stored on the product variant
+    // as product.template.attribute.value records. Pull them so the Deco Coat
+    // Order Form can be filled directly from the Odoo sales order.
+    const prodIds = [...new Set(lines.map(l=>toArr(l.product_id)[0]).filter(Boolean))];
+    const variants = prodIds.length ? await safeCall('variants','product.product','search_read',
+      [[['id','in',prodIds]]],
+      {fields:['id','product_template_attribute_value_ids']}) : [];
+    const ptavIds = [...new Set(variants.flatMap(v=>toArr(v.product_template_attribute_value_ids)))];
+    const ptavs = ptavIds.length ? await safeCall('ptavs','product.template.attribute.value','search_read',
+      [[['id','in',ptavIds]]],
+      {fields:['id','name','attribute_id']}) : [];
+    const ptavMap = {};
+    for(const a of ptavs){ ptavMap[a.id] = { attr:(toArr(a.attribute_id)[1]||'').trim(), val:(a.name||'').trim() }; }
+    const productAttrMap = {};
+    for(const v of variants){
+      productAttrMap[v.id] = toArr(v.product_template_attribute_value_ids).map(id=>ptavMap[id]).filter(Boolean);
+    }
+
+    // ── 1a-2. FREE-TEXT COLOUR NOTE LINE per SO ──────────────────────────
+    // Custom colours are typed on a separate order line (e.g. "Skyline Blue und
+    // Nightfall Blue. big yellow logo"), NOT as variant attributes — so read every
+    // line and keep the descriptive note that isn't the bike or the shipping line.
+    const allLineMeta = lineIds.length ? toArr(await odooCall('sale.order.line','search_read',
+      [[['id','in',lineIds]]],
+      {fields:['id','order_id','product_id','name','display_type']})) : [];
+    const bikeLineIdSet = new Set(lines.map(l=>l.id));
+    const colourNoteBySO = {};
+    for(const ml of allLineMeta){
+      if(bikeLineIdSet.has(ml.id)) continue;                       // skip the bike product line
+      const nm = (ml.name||'').replace(/\s+/g,' ').trim();
+      if(!nm) continue;
+      if(/shipping|verzend|transport|fret|freight/i.test(nm)) continue; // skip shipping
+      if(/^\[[A-Z0-9]+\]/.test(nm)) continue;                      // skip other catalogue products (SKU bracket)
+      const soId = toArr(ml.order_id)[0]; if(!soId) continue;
+      if(!colourNoteBySO[soId] || nm.length > colourNoteBySO[soId].length) colourNoteBySO[soId] = nm;
+    }
+
     // ── 1b. DELIVERY TRANSFERS — get date_deadline per SO ────────────────
     const soIds = soData.map(s=>s.id);
     const pickings = soIds.length ? toArr(await odooCall('stock.picking','search_read',
@@ -1061,6 +1099,9 @@ async function syncOdoo() {
             customer:toArr(so.partner_id)[1]||'',
             sku:pname, productId:toArr(l.product_id)[0],
             config:(l.name||'').replace(/\s+/g,' ').trim(),
+            configRaw:(l.name||''),
+            colourNote: colourNoteBySO[so.id] || '',
+            attrs: productAttrMap[toArr(l.product_id)[0]] || [],
             color:detectColor(pname),
             transmission:detectTransmission(pname),
             bikeType:detectBikeType(pname),
@@ -3880,57 +3921,108 @@ function newCustomOrders(){
 // line description (o.config / o.configuration), and fall back to a matching row in
 // the synced Decocoat file. This lets the feature work whether or not the running
 // version of syncOdoo captures the line description.
-function orderConfig(o){
-  if(o && o.config) return o.config;
-  if(o && o.configuration) return o.configuration;
-  const b = baseSO(o && o.name);
-  const d = (decocoatData||[]).find(x => baseSO(x.so) === b);
-  return d ? (d.config || '') : '';
-}
-function orderMainColor(o, parsed){
-  if(parsed && parsed.mainColor) return parsed.mainColor;
-  const b = baseSO(o && o.name);
-  const d = (decocoatData||[]).find(x => baseSO(x.so) === b);
-  return d ? (d.colorName || '') : '';
-}
 
 // Parse the colour spec out of an Odoo line description / configuration string.
 // Handles patterns like "Main: Nightfall Blue (Matte)" and "Rear: Bay Breeze Blue (Glossy)",
 // plus "Logo: Atomium Grey", "Logo size: Small", "Text: ...". Degrades gracefully.
-function parseConfig(text){
-  const t = (text||'').replace(/\s+/g,' ').trim();
+// Normalise a label so we can fuzzy-match attribute names regardless of wording/language.
+function _k(s){ return (s||'').toLowerCase().replace(/[^a-z]/g,''); }
+
+// Split free text ("Main frame color: Nightfall Blue\nFinish: Matte") into key:value pairs.
+function parsePairs(text){
+  const out = [];
+  for(const seg of String(text||'').split(/[\n;|]+/)){
+    const m = seg.match(/^\s*([^:]{2,40}?)\s*[:\-]\s*(.+?)\s*$/);
+    if(m) out.push({ attr:m[1], val:m[2] });
+  }
+  return out;
+}
+
+// Map a list of {attr,val} (Odoo variant attributes and/or parsed text) to Order Form columns.
+function mapToCols(pairs){
   const r = { mainColor:'', mainFinish:'', rearColor:'', rearFinish:'', logoColor:'', logoSize:'', personalText:'' };
-  if(!t) return r;
-  const grab = (re) => { const m = t.match(re); return m ? m[1].trim() : ''; };
-  const colFinish = (label) => {
-    const m = t.match(new RegExp(label+'\\s*[:\\-]?\\s*([^\\(/|,;]+?)\\s*\\(([^\\)]+)\\)','i'));
-    if(m) return [m[1].trim(), m[2].trim()];
-    const m2 = t.match(new RegExp(label+'\\s*[:\\-]\\s*([^/|,;]+)','i'));
-    return m2 ? [m2[1].trim(),''] : ['',''];
-  };
-  [r.mainColor, r.mainFinish] = colFinish('Main(?:\\s*frame)?');
-  [r.rearColor, r.rearFinish] = colFinish('Rear(?:\\s*frame)?');
-  r.logoColor   = grab(/Logo(?:\s*colou?r)?\s*[:\-]\s*([^/|,;\(]+)/i);
-  r.logoSize    = grab(/Logo\s*size\s*[:\-]\s*([^/|,;\(]+)/i) || grab(/\b(Small|Medium|Large)\b/i);
-  r.personalText= grab(/(?:Personal\s*)?Text\s*[:\-]\s*([^/|]+)/i);
-  // If nothing matched but there is a single colour-looking string, use it as main colour.
-  if(!r.mainColor && t && !/[:]/.test(t)) r.mainColor = t;
+  const set = (k,v)=>{ if(v && !r[k]) r[k]=v; };
+  for(const p of pairs){
+    const k=_k(p.attr); let v=String(p.val||'').trim(); if(!v) continue;
+    // "Nightfall Blue (Matte)" → colour + inline finish
+    let inlineFinish=''; const pm=v.match(/^(.*?)\s*\(([^)]+)\)\s*$/); if(pm){ v=pm[1].trim(); inlineFinish=pm[2].trim(); }
+    const isMain=k.includes('main')||k.includes('front')||k.includes('hoofd');
+    const isRear=k.includes('rear')||k.includes('back')||k.includes('achter');
+    const isFinish=k.includes('finish')||k.includes('effect')||k.includes('afwerk');
+    const isColor=k.includes('color')||k.includes('colour')||k.includes('kleur')||k.includes('ral')||k.includes('frame');
+    const isLogo=k.includes('logo');
+    const isSize=k.includes('size')||k.includes('maat');
+    const isText=k.includes('text')||k.includes('tekst')||k.includes('personal');
+    if(isLogo && isSize) set('logoSize',v);
+    else if(isLogo) set('logoColor',v);
+    else if(isText) set('personalText',v);
+    else if(isRear && isFinish) set('rearFinish',v);
+    else if(isRear){ set('rearColor',v); set('rearFinish',inlineFinish); }
+    else if(isFinish) set('mainFinish',v);
+    else if(isColor){ set('mainColor',v); set('mainFinish',inlineFinish); }
+    else if(isMain){ set('mainColor',v); set('mainFinish',inlineFinish); }
+  }
   return r;
 }
 
+// Resolve every Order Form colour column for an order, preferring Odoo data.
+// Parse an informal, free-text colour note like:
+//   "Skyline Blue und Nightfall Blue. big yellow logo"
+//   "Poppy Pink / Bay Breeze Blue, small grey logo"
+// First colour = main frame, second = rear frame; "logo" phrase gives logo colour + size.
+// Best-effort only — the full note is always kept in the Configuration column.
+function parseFreeColour(text){
+  const r = { mainColor:'', mainFinish:'', rearColor:'', rearFinish:'', logoColor:'', logoSize:'', personalText:'' };
+  let t = String(text||'').trim(); if(!t) return r;
+  const finishRe = /\b(matte?|mat|glossy?|gloss|satin|glans|glanz|metallic)\b/i;
+  const sizeRe   = /\b(big|large|small|medium|grand|petit|klein|groot|gross|groß|xl|xs)\b/i;
+  // pull out the logo phrase
+  const lm = t.match(/([^.,;]*\blogo'?s?\b[^.,;]*)/i);
+  if(lm){
+    const logo = lm[1]; t = t.replace(lm[1], ' ');
+    const sz = logo.match(sizeRe); if(sz) r.logoSize = sz[1];
+    const lc = logo.replace(/\blogo'?s?\b/ig,' ').replace(sizeRe,' ').replace(/\b(colou?r|kleur)\b/ig,' ').replace(/\s+/g,' ').trim();
+    if(lc) r.logoColor = lc;
+  }
+  // remaining text → colour list split on connectors
+  const clean = (s)=>{ const f=s.match(finishRe); const fin=f?f[1]:''; const col=s.replace(finishRe,'').replace(/[.,;]/g,' ').replace(/\s+/g,' ').trim(); return [col,fin]; };
+  const parts = t.split(/\b(?:und|and|en|et)\b|[\/&+]/i).map(s=>s.replace(/[.,;]/g,' ').replace(/\s+/g,' ').trim()).filter(Boolean);
+  if(parts[0]){ const [c,f]=clean(parts[0]); r.mainColor=c; r.mainFinish=f; }
+  if(parts[1]){ const [c,f]=clean(parts[1]); r.rearColor=c; r.rearFinish=f; }
+  return r;
+}
+
+function orderCols(o){
+  const note = String(o && o.colourNote || '').trim();
+  // 1) PRIMARY: the free-text colour note typed on the order line
+  let cols = note ? parseFreeColour(note) : { mainColor:'', mainFinish:'', rearColor:'', rearFinish:'', logoColor:'', logoSize:'', personalText:'' };
+  // 2) fill any gaps from structured variant attributes / "key: value" text
+  let pairs = Array.isArray(o && o.attrs) ? o.attrs.slice() : [];
+  pairs = pairs.concat(parsePairs(o && (o.configRaw || o.config)));
+  const extra = mapToCols(pairs);
+  for(const k of Object.keys(cols)){ if(!cols[k] && extra[k]) cols[k] = extra[k]; }
+  // 3) Decocoat sheet fallback for main colour
+  const dc = (decocoatData||[]).find(x => baseSO(x.so) === baseSO(o && o.name));
+  if(!cols.mainColor && dc) cols.mainColor = dc.colorName || '';
+  // Configuration column = the full note (preferred), else line text, else Decocoat config
+  cols.configText = note || String(o && o.config || '').trim() || (dc ? (dc.config||'') : '');
+  return cols;
+}
+function orderConfig(o){ return orderCols(o).configText; }
+function orderMainColor(o){ return orderCols(o).mainColor; }
+
 // Map one planner order -> one Order Form row (array matching ORDER_FORM_HEADERS).
 function orderToFormRow(o){
-  const cfgText = orderConfig(o);
-  const c = parseConfig(cfgText);
+  const c = orderCols(o);
   return [
     '',                          // Prod Week — Deco Coat confirms
     o.poRef || '',               // PO#
     o.name || '',                // SO#
     o.sku || '',                 // Bike SKU
-    cfgText || '',               // Configuration (from Odoo, or Decocoat fallback)
+    c.configText || '',          // Configuration (from Odoo, or Decocoat fallback)
     1,                           // Quantity
     '1- Order',                  // Status
-    orderMainColor(o, c),        // Main Frame custom color
+    c.mainColor,                 // Main Frame custom color
     c.mainFinish,                // Main frame finish effect
     c.rearColor,                 // Rear frame custom color
     c.rearFinish,                // Rear frame finish effect
@@ -4002,9 +4094,8 @@ function exportUpdatedDecocoat(){
   }
   // Append the new orders pulled from Odoo.
   for(const o of fresh){
-    const cfgText = orderConfig(o);
-    const c = parseConfig(cfgText);
-    aoa.push([ o.name||'', o.poRef||'', o.customer||'', o.sku||'', cfgText||'', orderMainColor(o,c)||'',
+    const c = orderCols(o);
+    aoa.push([ o.name||'', o.poRef||'', o.customer||'', o.sku||'', c.configText||'', c.mainColor||'',
       '1- Order', '', '', '', 'NEW (from Odoo)' ]);
   }
 
