@@ -1980,7 +1980,31 @@ function buildRollingSchedule() {
     });
 
   const standardQueued = allQueued.filter(o=>o.color!=='custom');
-  const customQueued = allQueued.filter(o=>o.color==='custom');
+
+  // Custom bikes are proposed without a date guard, so we must make sure we
+  // don't propose ordering a custom bike that already has supply on the way:
+  // a real bike in transit / in the warehouse (not reserved to another order),
+  // or leftover capacity on an issued PO. Build a pool of that still-available
+  // supply (what standard matching/coverage left over) and consume it as we go,
+  // so each available bike only excludes one custom order.
+  const supplyPool = [];
+  for(const s of stock){
+    if(s.reservedFor) continue;
+    if(!['AND/In Transit','AND/Warehouse','LOUI/Stock'].includes(s.location)) continue;
+    supplyPool.push({productId:s.productId, color:s.color, transmission:s.transmission, bikeType:s.bikeType, rack:s.rack});
+  }
+  for(const s of issuedPOSupply){
+    for(let i=0;i<(s.remaining||0);i++) supplyPool.push({productId:s.productId, color:s.color, transmission:s.transmission, bikeType:s.bikeType, rack:s.rack});
+  }
+  const matchesSupply = (o,sup) =>
+    (o.productId && String(sup.productId)===String(o.productId)) ||
+    (sup.color===o.color && sup.transmission===o.transmission && sup.bikeType===o.bikeType && sup.rack===o.rack);
+
+  const customQueued = allQueued.filter(o=>o.color==='custom').filter(o=>{
+    const idx = supplyPool.findIndex(sup=>matchesSupply(o,sup));
+    if(idx>=0){ supplyPool.splice(idx,1); return false; } // already covered by incoming supply → don't re-propose
+    return true; // genuinely needs ordering
+  });
 
   const weeks = nextMondays(6);
   const weekPlans = [];
@@ -3297,19 +3321,89 @@ function parseCSV(text) {
   return rows;
 }
 
+// Decocoat status counts as "already heading to VV / in production" — the bike
+// will be produced within ~10 days and is therefore on an existing PO.
+function isDecocoatInVVPipeline(status, arrivalAtVV){
+  const s = String(status||'').toLowerCase();
+  if(arrivalAtVV) return true;                 // an arrival-at-VV date is set
+  return s.includes('vv') || s.includes('in transit') || s.includes('in production') || s.includes('transit to');
+}
+
 function applyDecocoatToOrders() {
-  // Re-apply Decocoat serial/delivery data to orders after any sync
+  // Map each CUSTOM-colour sales order to its Decocoat row(s) and decide
+  // coverage using the real Decocoat process:
+  //   1) a frame/serial is assigned        -> bike is IN PRODUCTION, ~1 week to
+  //                                            ship -> covered (not re-proposed)
+  //   2) no serial, but status shows it's   -> will be produced within ~10 days;
+  //      at / heading to VV (in transit or     attribute-match it to an open/
+  //      in production at VV)                   future custom-colour PO of the
+  //                                             same config and consume that PO's
+  //                                             capacity, so neither the order
+  //                                             nor the PO is double-proposed.
+  // Custom orders with neither signal stay queued and can be proposed.
+
+  // Index decocoat rows by SO (exact + base number, e.g. "S22337 (1/5)" -> S22337)
+  const bySO = {};
   for(const d of decocoatData){
-    if(!d.estimatedWarehouse && !d.bikeId) continue;
+    if(!d.so) continue;
     const baseSO = d.so.split('(')[0].trim().split(' ')[0].trim();
-    const matchingOrders = [...orders,...manualOrders].filter(o=>
-      (o.name === d.so || o.name === baseSO) && o.color === 'custom'
-    );
-    for(const o of matchingOrders){
-      if(d.bikeId) o.serialEst = d.bikeId;
-      if(d.estimatedWarehouse) o.estimatedDelivery = d.estimatedWarehouse;
-      if(d.poRef) o.poRef = d.poRef;
-      if(d.status) o.decocoatStatus = d.status;
+    (bySO[baseSO] = bySO[baseSO] || []).push(d);
+    if(d.so !== baseSO) (bySO[d.so] = bySO[d.so] || []).push(d);
+  }
+
+  const today = new Date().toISOString().split('T')[0];
+
+  // Local working copy of open custom-colour PO capacity (don't mutate the
+  // global issuedPOSupply — this runs on standalone Decocoat syncs too).
+  const poCap = issuedPOSupply.map(s=>({...s, left:s.remaining||0}));
+
+  for(const o of [...orders,...manualOrders]){
+    if(o.color !== 'custom') continue;
+    const rows = bySO[o.name] || [];
+    if(!rows.length) continue;
+
+    // Prefer a row that carries a serial; otherwise the first row for this SO
+    const row = rows.find(d=>d.bikeId) || rows[0];
+
+    // Always surface the latest Decocoat display info
+    if(row.bikeId) o.serialEst = row.bikeId;
+    if(row.estimatedWarehouse) o.estimatedDelivery = row.estimatedWarehouse;
+    if(row.status) o.decocoatStatus = row.status;
+
+    // If already covered by stock/transit/an explicit PO, leave it alone
+    if(['inprod','stock_match','transit_match','shipped','hold'].includes(o.status)) {
+      if(!o.poRef && row.poRef) o.poRef = row.poRef;
+      continue;
+    }
+
+    if(row.bikeId){
+      // (1) Serial assigned = in production, ~1 week to ship
+      o.status = 'inprod';
+      o.coveredByDecocoat = true;
+      if(!o.poRef) o.poRef = row.poRef || null;
+      if(!o.estimatedDelivery) o.estimatedDelivery = row.estimatedWarehouse || addDaysStr(today, 7);
+    } else if(isDecocoatInVVPipeline(row.status, row.arrivalAtVV)){
+      // (2) No serial but at/heading to VV = produced within ~10 days.
+      //     Attribute-match an open custom-colour PO (same config) and consume it.
+      const m = poCap.find(s=>s.left>0 && (
+        (o.productId && String(s.productId)===String(o.productId)) ||
+        (s.color==='custom' && s.transmission===o.transmission && s.bikeType===o.bikeType && s.rack===o.rack)
+      ));
+      o.status = 'inprod';
+      o.coveredByDecocoat = true;
+      if(m){
+        m.left--;
+        if(!o.poRef) o.poRef = m.poName;
+        if(!o.estimatedDelivery) o.estimatedDelivery = m.expectedArrival || addDaysStr(today, 10);
+      } else {
+        if(!o.poRef) o.poRef = row.poRef || null;
+        if(!o.estimatedDelivery) o.estimatedDelivery = row.estimatedWarehouse || addDaysStr(today, 10);
+      }
+    } else {
+      // Row exists but earlier stage (e.g. still at Decocoat painting) and no
+      // serial -> not yet committed to production; carry any PO# but leave it
+      // available to be proposed.
+      if(!o.poRef && row.poRef) o.poRef = row.poRef;
     }
   }
 }
