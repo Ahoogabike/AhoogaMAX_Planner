@@ -2046,8 +2046,35 @@ function buildRollingSchedule() {
     for(const fs of weekFamilies){
       const minRequired = fs.fam.startsWith('emax') ? (cfg.minEmax||40) : (cfg.minAmax||20);
       const included = fs.orders; // all remaining orders of this family
-      const shortfall = Math.max(0, minRequired - included.length);
       const matchingCustom = customQueued.filter(o=>!assigned.has(o.id)&&transmissionFamily(o)===fs.fam);
+
+      // Always order at least a full batch: if the matched sales orders don't
+      // reach the minimum, top the PO up with free-stock filler bikes (no sales
+      // order — these become free stock when received). Filler uses the most
+      // common config among the matched orders for this family.
+      const realCount = included.length + matchingCustom.length;
+      const fillerCount = Math.max(0, minRequired - realCount);
+      const filler = [];
+      if(fillerCount > 0){
+        const cfgCount = {};
+        for(const o of [...included,...matchingCustom]){
+          const k = `${o.sku}||${o.color}||${o.rack}`;
+          cfgCount[k] = (cfgCount[k]||0)+1;
+        }
+        const bestKey = Object.entries(cfgCount).sort((a,b)=>b[1]-a[1])[0]?.[0];
+        const ref = included[0] || matchingCustom[0] || {};
+        const [fSku,fColor,fRack] = bestKey ? bestKey.split('||') : [ref.sku||'', ref.color||'', ref.rack||''];
+        for(let i=0;i<fillerCount;i++){
+          filler.push({
+            id: `filler_${week}_${fs.fam}_${i}`,
+            name: '— free stock —', customer: '(stock build-up)',
+            sku: fSku, color: fColor, rack: fRack,
+            transmission: ref.transmission||'', bikeType: ref.bikeType||'',
+            deadline: null, isFiller: true
+          });
+        }
+      }
+      const shortfall = fillerCount; // now topped up rather than left short
 
       proposals.push({
         id: `prop_${week}_${fs.fam}`,
@@ -2055,6 +2082,7 @@ function buildRollingSchedule() {
         week,
         orders: included,
         customOrders: matchingCustom,
+        fillerOrders: filler,
         shortfall,
         topSku: included[0]?.sku||'',
         expectedArrival,
@@ -2150,7 +2178,8 @@ function renderProposal(proposals) {
     </div>
     ${proposals.map((p,i) => {
       const famLabel = p.fam.replace('_',' ').toUpperCase();
-      const totalBikes = p.orders.length + p.customOrders.length;
+      const fillerOrders = p.fillerOrders || [];
+      const totalBikes = p.orders.length + p.customOrders.length + fillerOrders.length;
       const rows = p.orders.map((o,j) => `
         <tr>
           <td>${j+1}</td>
@@ -2173,9 +2202,20 @@ function renderProposal(proposals) {
           <td>${o.deadline?fmtDate(o.deadline):'—'}</td>
           <td></td>
         </tr>`).join('');
-      const shortfallWarn = p.shortfall>0 ? `
-        <div class="conflict-warn" style="margin:10px 0 0">
-          ⚠ ${p.shortfall} bikes below minimum (${p.minRequired}) — add <strong>${p.shortfall} × ${p.topSku}</strong> to stock
+      const fillerRows = fillerOrders.map((o,j) => `
+        <tr style="background:var(--surface2);color:var(--text2)">
+          <td>${p.orders.length+p.customOrders.length+j+1}</td>
+          <td style="font-style:italic">free stock</td>
+          <td style="font-style:italic">(stock build-up)</td>
+          <td style="font-size:12px">${o.sku}</td>
+          <td>${colorDot(o.color)}${o.color}</td>
+          <td>${o.rack}</td>
+          <td>—</td>
+          <td><span class="badge" style="background:var(--surface);color:var(--text3)">stock</span></td>
+        </tr>`).join('');
+      const fillerNote = fillerOrders.length>0 ? `
+        <div class="alert alert-info" style="margin:10px 0 0">
+          Topped up to the ${p.minRequired}-bike minimum: ${p.orders.length+p.customOrders.length} for orders + <strong>${fillerOrders.length} free-stock</strong> ${fillerOrders.length===1?'bike':'bikes'} (${p.fillerOrders[0].color} ${p.fillerOrders[0].rack}).
         </div>` : '';
       return `
         <div class="po-card" style="margin-bottom:16px">
@@ -2185,12 +2225,13 @@ function renderProposal(proposals) {
             <div class="po-family-tags">
               <span class="family-tag ${p.fam.includes('alfine')?'alfine':'der'}">${famLabel}</span>
               ${p.customOrders.length?`<span class="family-tag" style="background:var(--purple-bg);color:var(--purple)">${p.customOrders.length} custom</span>`:''}
+              ${fillerOrders.length?`<span class="family-tag" style="background:var(--surface2);color:var(--text2)">${fillerOrders.length} free stock</span>`:''}
             </div>
           </div>
-          <div style="padding:0 18px">${shortfallWarn}</div>
+          <div style="padding:0 18px">${fillerNote}</div>
           <table class="data-table">
             <thead><tr><th>#</th><th>Order</th><th>Customer</th><th>SKU</th><th>Color</th><th>Rack</th><th>Deadline</th><th>Urgent</th></tr></thead>
-            <tbody>${rows}${customRows}</tbody>
+            <tbody>${rows}${customRows}${fillerRows}</tbody>
           </table>
           <div style="padding:14px 18px;display:flex;gap:10px;border-top:1px solid var(--border)">
             <button class="btn btn-primary" onclick="confirmProposal(${JSON.stringify(p).replace(/"/g,'&quot;')})">✓ Confirm this PO</button>
@@ -2213,7 +2254,7 @@ function renderFutureWeeks(weekPlans) {
   if(!weekPlans.length) return;
 
   const html = weekPlans.map(wp=>{
-    const totalBikes = wp.proposals.reduce((s,p)=>s+p.orders.length+p.customOrders.length,0);
+    const totalBikes = wp.proposals.reduce((s,p)=>s+p.orders.length+p.customOrders.length+(p.fillerOrders?p.fillerOrders.length:0),0);
     const famTags = wp.proposals.map(p=>{
       const cls = p.fam.includes('alfine')?'alfine':p.fam.includes('der')?'der':'emax';
       return `<span class="family-tag ${cls}">${p.fam.replace('_',' ').toUpperCase()}</span>`;
@@ -2258,6 +2299,8 @@ function confirmProposal(p) {
     orderIds: allIds,
     families: [p.fam],
     expectedArrival: p.expectedArrival,
+    fillerCount: (p.fillerOrders ? p.fillerOrders.length : 0),
+    totalBikes: allIds.length + (p.fillerOrders ? p.fillerOrders.length : 0),
     confirmed: true
   });
   assignSerials();
