@@ -542,6 +542,7 @@ let manualOrders = []; // Virtual orders (e.g. Matt Cooke reservations)
 let decocoatData = [];
 let vvStock = [];
 let issuedPOSupply = []; // remaining-to-receive on every open purchase order for bikes (mirrors the Coming Next app)
+let forecastMix = null;  // {color:{yellow,black,red}, rack:{'rack','no rack'}} pools = YTD invoiced + current order book
 let lotToPOMap = {};
 let okaziByProduct = {}; // serial -> PO name // bikes at VV assembly with predicted serials // {so, bikeId, sku, status, arrivalAtVV, estimatedWarehouse, poRef, color, config}
 
@@ -1303,6 +1304,9 @@ async function syncOdoo() {
     // ADDITIONAL PO for whatever sales orders are still left uncovered.
     await accountForIssuedPOs();
 
+    // ── Step 2c: FORECAST POOLS (colour & rack mix for free-stock filler) ──
+    await computeForecastPools();
+
     // ── Step 3: Register tracked Okazi POs into local poList ─────────────
     for(const po of okaziPOs){
       const poName = po.name;
@@ -1967,7 +1971,113 @@ async function accountForIssuedPOs() {
   }
 }
 
+async function computeForecastPools() {
+  // Build the same "pool" the forecast report uses — YTD invoiced + current
+  // order book — but broken down by COLOUR (yellow/black/red, custom excluded)
+  // and by RACK. The proportions of these pools drive the free-stock mix.
+  forecastMix = null;
+  const toArr = v => Array.isArray(v) ? v : (v ? [v] : []);
+  const colorPool = {yellow:0, black:0, red:0};
+  const rackPool  = {'rack':0, 'no rack':0};
+  const modelPool = {}; // family key (bikeType_transmission) -> pool count
+  const addModel = (fam, n) => { if(fam && fam!=='_'&&!fam.startsWith('undefined')) modelPool[fam]=(modelPool[fam]||0)+n; };
+  try {
+    // YTD invoiced MAX bikes (orders dated this year, any invoiced qty)
+    const yearStart = `${new Date().getFullYear()}-01-01`;
+    const invLines = toArr(await odooCall('sale.order.line','search_read',
+      [[['qty_invoiced','>',0],['order_id.date_order','>=',yearStart],['product_id.categ_id.complete_name','ilike','Bikes'],['product_id.name','ilike','MAX']]],
+      {fields:['product_id','qty_invoiced'],limit:20000}));
+    for(const l of invLines){
+      const pname = toArr(l.product_id)[1]||'';
+      const c = detectColor(pname), r = detectRack(pname);
+      const fam = `${detectBikeType(pname)}_${detectTransmission(pname)}`;
+      const q = parseFloat(l.qty_invoiced)||0;
+      if(colorPool[c]!=null) colorPool[c] += q;
+      if(rackPool[r]!=null)  rackPool[r]  += q;
+      addModel(fam, q);
+    }
+  } catch(e){ console.warn('Forecast YTD-invoiced read failed:', e.message); }
+
+  // Current order book = open sales-order units the planner already holds
+  for(const o of orders){
+    if(colorPool[o.color]!=null) colorPool[o.color] += 1;
+    if(rackPool[o.rack]!=null)  rackPool[o.rack]  += 1;
+    addModel(`${o.bikeType}_${o.transmission}`, 1);
+  }
+
+  // Per-SKU numbers published by the Sales Forecast app (sales-forecast.html).
+  // When present, these drive the free-stock build-up directly.
+  let bySku=null, fcYear=null, fcUpdated=null;
+  try{
+    const fc=await kvGet('sales_forecast');
+    if(fc && fc.forwardBySku && typeof fc.forwardBySku==='object'){ bySku=fc.forwardBySku; fcYear=fc.year; fcUpdated=fc.updated; }
+  }catch(e){ console.warn('sales_forecast read failed:', e.message); }
+
+  forecastMix = { color: colorPool, rack: rackPool, model: modelPool, bySku, fcYear, fcUpdated, source: bySku?'sales-forecast.html':'live pools' };
+}
+
+// Integer allocation of `total` across weighted keys (largest-remainder method)
+function allocateByMix(weights, total){
+  const keys = Object.keys(weights);
+  const out = {}; keys.forEach(k=>out[k]=0);
+  const sum = keys.reduce((s,k)=>s+(weights[k]||0),0);
+  if(total<=0) return out;
+  if(sum<=0){ // no signal: even split
+    for(let i=0;i<total;i++) out[keys[i%keys.length]]++;
+    return out;
+  }
+  const rem=[]; let used=0;
+  for(const k of keys){ const v=(weights[k]/sum)*total; const f=Math.floor(v); out[k]=f; used+=f; rem.push([k,v-f]); }
+  let left=total-used; rem.sort((a,b)=>b[1]-a[1]);
+  for(let i=0;i<left;i++) out[rem[i%rem.length][0]]++;
+  return out;
+}
+
+// Filler counts for one dimension that push the PO toward the forecast mix,
+// accounting for what the real orders already cover. Always sums to fillerN.
+function fillerCountsForDimension(mix, already, fillerN){
+  const keys = Object.keys(mix);
+  const alreadyTotal = keys.reduce((s,k)=>s+(already[k]||0),0);
+  const target = allocateByMix(mix, alreadyTotal + fillerN);
+  const filler = {}; let assigned=0;
+  for(const k of keys){ filler[k]=Math.max(0, target[k]-(already[k]||0)); assigned+=filler[k]; }
+  let diff = fillerN - assigned;
+  const order = keys.slice().sort((a,b)=>(mix[b]||0)-(mix[a]||0));
+  let i=0; while(diff>0){ filler[order[i%order.length]]++; diff--; i++; }
+  const rev = order.slice().reverse(); i=0; let guard=0;
+  while(diff<0 && guard++<10000){ const k=rev[i%rev.length]; if(filler[k]>0){ filler[k]--; diff++; } i++; }
+  return filler;
+}
+
+// Best real SKU/productId for a family + colour + rack, else a descriptive label
+function skuForConfig(fam, color, rack){
+  const pool = [...orders, ...manualOrders, ...stock, ...vvStock];
+  const hit = pool.find(o=>(`${o.bikeType}_${o.transmission}`)===fam && o.color===color && o.rack===rack && (o.sku||o.productId));
+  if(hit) return { sku: hit.sku || `${fam.replace('_',' ').toUpperCase()} ${color} ${rack}`, productId: hit.productId||null };
+  return { sku: `${fam.replace('_',' ').toUpperCase()} · ${color} · ${rack}`, productId: null };
+}
+
+// Already-available FREE stock (not assigned to any order), keyed by
+// `family|color|rack`. Used so we don't keep building free stock of a config we
+// already hold. Free = unreserved warehouse/transit/LOUI bikes + the portion of
+// open-PO (VV) bikes not yet assigned to an in-production order.
+function getFreeStockCounts(){
+  const map = {};
+  const add = (fam,color,rack,n)=>{ if(n>0){ const k=`${fam}|${color}|${rack}`; map[k]=(map[k]||0)+n; } };
+  for(const s of stock){
+    if(s.reservedFor) continue;
+    if(!['AND/Warehouse','AND/In Transit','LOUI/Stock'].includes(s.location)) continue;
+    add(`${s.bikeType}_${s.transmission}`, s.color, s.rack, 1);
+  }
+  for(const item of vvStock){
+    const assigned = [...orders,...manualOrders].filter(o=>o.status==='inprod' && o.sku===item.sku).length;
+    add(`${item.bikeType}_${item.transmission}`, item.color, item.rack, Math.max(0, item.qty - assigned));
+  }
+  return map;
+}
+
 function buildRollingSchedule() {
+  const freeStockCounts = getFreeStockCounts();
   // Build a 6-week rolling production plan for ALL queued orders
   // Returns: array of week plans [{week, proposals:[{fam, orders, customOrders, expectedArrival}]}]
   const allQueued = [...orders,...manualOrders]
@@ -2056,22 +2166,61 @@ function buildRollingSchedule() {
       const fillerCount = Math.max(0, minRequired - realCount);
       const filler = [];
       if(fillerCount > 0){
-        const cfgCount = {};
-        for(const o of [...included,...matchingCustom]){
-          const k = `${o.sku}||${o.color}||${o.rack}`;
-          cfgCount[k] = (cfgCount[k]||0)+1;
+        const [bt,tr] = fs.fam.split('_');
+        const COLS=['yellow','black','red'], RKS=['rack','no rack'];
+        const realNon = [...included,...matchingCustom].filter(o=>o.color!=='custom');
+        // real orders already in this PO, per colour|rack
+        const alreadyCfg = {};
+        for(const o of realNon){ const k=`${o.color}|${o.rack}`; alreadyCfg[k]=(alreadyCfg[k]||0)+1; }
+
+        const bySku = forecastMix && forecastMix.bySku;
+        let counts = {}; // 'colour|rack' -> filler count
+
+        if(bySku){
+          // Take the numbers straight from the Sales Forecast app: for each
+          // config the remaining forecast need = forecast going-forward − free
+          // stock we already hold − units already in this PO. Allocate the
+          // filler across configs in proportion to that remaining need.
+          const weights = {};
+          for(const c of COLS) for(const r of RKS){
+            const fc    = bySku[`${bt}|${tr}|${c}|${r}`] || 0;
+            const free  = freeStockCounts[`${fs.fam}|${c}|${r}`] || 0;
+            const inPO  = alreadyCfg[`${c}|${r}`] || 0;
+            weights[`${c}|${r}`] = Math.max(0, fc - free - inPO);
+          }
+          counts = allocateByMix(weights, fillerCount);
+        } else {
+          // Fallback (forecast not published yet): independent colour & rack
+          // pools from live Odoo data, net of free stock.
+          const colorMix = (forecastMix && forecastMix.color) ? forecastMix.color : {yellow:1,black:1,red:1};
+          const rackMix  = (forecastMix && forecastMix.rack)  ? forecastMix.rack  : {'rack':1,'no rack':1};
+          const alreadyColor = {yellow:0,black:0,red:0}, alreadyRack = {'rack':0,'no rack':0};
+          for(const o of realNon){ if(alreadyColor[o.color]!=null) alreadyColor[o.color]++; if(alreadyRack[o.rack]!=null) alreadyRack[o.rack]++; }
+          for(const c of COLS) for(const r of RKS){ const n=freeStockCounts[`${fs.fam}|${c}|${r}`]||0; if(n){ alreadyColor[c]+=n; alreadyRack[r]+=n; } }
+          const colorCounts = fillerCountsForDimension(colorMix, alreadyColor, fillerCount);
+          const rackCounts  = fillerCountsForDimension(rackMix,  alreadyRack,  fillerCount);
+          const colorList=[]; for(const c of COLS) for(let i=0;i<(colorCounts[c]||0);i++) colorList.push(c);
+          const rackList=[];  for(const r of RKS) for(let i=0;i<(rackCounts[r]||0);i++)  rackList.push(r);
+          for(let i=0;i<fillerCount;i++){ const k=`${colorList[i]||'yellow'}|${rackList[i]||'no rack'}`; counts[k]=(counts[k]||0)+1; }
         }
-        const bestKey = Object.entries(cfgCount).sort((a,b)=>b[1]-a[1])[0]?.[0];
+
+        // materialise filler bikes from the per-config counts
         const ref = included[0] || matchingCustom[0] || {};
-        const [fSku,fColor,fRack] = bestKey ? bestKey.split('||') : [ref.sku||'', ref.color||'', ref.rack||''];
-        for(let i=0;i<fillerCount;i++){
-          filler.push({
-            id: `filler_${week}_${fs.fam}_${i}`,
-            name: '— free stock —', customer: '(stock build-up)',
-            sku: fSku, color: fColor, rack: fRack,
-            transmission: ref.transmission||'', bikeType: ref.bikeType||'',
-            deadline: null, isFiller: true
-          });
+        let made = 0;
+        for(const c of COLS) for(const r of RKS){
+          const n = counts[`${c}|${r}`] || 0;
+          for(let i=0;i<n;i++){
+            const cfgSku = skuForConfig(fs.fam, c, r);
+            filler.push({
+              id: `filler_${week}_${fs.fam}_${made}`,
+              name: '— free stock —', customer: '(stock build-up)',
+              sku: cfgSku.sku, productId: cfgSku.productId,
+              color: c, rack: r,
+              transmission: ref.transmission||tr, bikeType: ref.bikeType||bt,
+              deadline: null, isFiller: true
+            });
+            made++;
+          }
         }
       }
       const shortfall = fillerCount; // now topped up rather than left short
@@ -2213,10 +2362,22 @@ function renderProposal(proposals) {
           <td>—</td>
           <td><span class="badge" style="background:var(--surface);color:var(--text3)">stock</span></td>
         </tr>`).join('');
-      const fillerNote = fillerOrders.length>0 ? `
+      const fillerNote = fillerOrders.length>0 ? (()=>{
+        const bd = {};
+        for(const o of fillerOrders){ const k=`${o.color} ${o.rack}`; bd[k]=(bd[k]||0)+1; }
+        const breakStr = Object.entries(bd).sort((a,b)=>b[1]-a[1]).map(([k,n])=>`${n} ${k}`).join(', ');
+        let modelStr = '';
+        if(forecastMix && forecastMix.model){
+          const tot = Object.values(forecastMix.model).reduce((a,b)=>a+b,0);
+          const share = tot ? Math.round((forecastMix.model[p.fam]||0)/tot*100) : 0;
+          if(tot) modelStr = ` · model forecast share ~${share}%`;
+        }
+        const srcStr = (forecastMix && forecastMix.bySku) ? ' (from Sales Forecast app)' : ' (from live Odoo pools)';
+        return `
         <div class="alert alert-info" style="margin:10px 0 0">
-          Topped up to the ${p.minRequired}-bike minimum: ${p.orders.length+p.customOrders.length} for orders + <strong>${fillerOrders.length} free-stock</strong> ${fillerOrders.length===1?'bike':'bikes'} (${p.fillerOrders[0].color} ${p.fillerOrders[0].rack}).
-        </div>` : '';
+          Topped up to the ${p.minRequired}-bike minimum: ${p.orders.length+p.customOrders.length} for orders + <strong>${fillerOrders.length} free-stock</strong> ${fillerOrders.length===1?'bike':'bikes'} split on the forecast SKU mix${srcStr}, net of free stock already held (${breakStr})${modelStr}.
+        </div>`;
+      })() : '';
       return `
         <div class="po-card" style="margin-bottom:16px">
           <div class="po-header">
