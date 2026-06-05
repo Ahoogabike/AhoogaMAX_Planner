@@ -156,6 +156,7 @@ main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
 
 @media(max-width:900px){.kpi-row{grid-template-columns:repeat(2,1fr)}}
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -310,6 +311,19 @@ main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
       Custom color bikes have serials assigned manually via your paint supplier (Decocoat). 
       Serial numbers are tracked in your Sharepoint file. 
       Future: upload weekly Excel from paint supplier or connect Google Sheets.
+    </div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;margin-bottom:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+        <strong style="font-size:13px">Deco Coat forms</strong>
+        <span style="font-size:11px;color:var(--text3)">From Odoo custom-colour orders · only those not yet in the Decocoat file</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px">
+        <button class="btn btn-primary btn-sm" onclick="exportOrderForm()">⬇ Order Form — new orders</button>
+        <button class="btn btn-success btn-sm" onclick="exportUpdatedDecocoat()">⬇ Updated Decocoat file</button>
+        <button class="btn btn-secondary btn-sm" onclick="exportOrderForm({all:true})">⬇ All custom orders</button>
+        <button class="btn btn-secondary btn-sm" onclick="exportOrderForm({blank:true})">⬇ Blank template</button>
+      </div>
+      <div id="forms-alert" style="margin-top:8px"></div>
     </div>
     <div class="toolbar">
       <input type="text" id="custom-search" placeholder="Search order, customer…" oninput="renderCustom()"/>
@@ -890,7 +904,7 @@ async function syncOdoo() {
     // Only fetch lines for bike products (all Bikes categories)
     const lines = lineIds.length ? toArr(await odooCall('sale.order.line','search_read',
       [[['id','in',lineIds],['product_uom_qty','>',0],['product_id.categ_id.complete_name','ilike','Bikes']]],
-      {fields:['order_id','product_id','product_uom_qty','qty_delivered']})) : [];
+      {fields:['order_id','product_id','product_uom_qty','qty_delivered','name']})) : [];
 
     // ── 1b. DELIVERY TRANSFERS — get date_deadline per SO ────────────────
     const soIds = soData.map(s=>s.id);
@@ -1046,6 +1060,7 @@ async function syncOdoo() {
             id:bikeId, name:so.name, lineId:l.id, bikeIndex:bi,
             customer:toArr(so.partner_id)[1]||'',
             sku:pname, productId:toArr(l.product_id)[0],
+            config:(l.name||'').replace(/\s+/g,' ').trim(),
             color:detectColor(pname),
             transmission:detectTransmission(pname),
             bikeType:detectBikeType(pname),
@@ -3824,6 +3839,182 @@ function exportShipList() {
   const win = window.open('', '_blank');
   win.document.write(html);
   win.document.close();
+}
+
+// ─── DECO COAT FORM EXPORTS (Excel) ──────────────────────
+// Source of truth = the Odoo custom-colour sales orders. The Decocoat file is
+// what has ALREADY been ordered. So we: (1) take custom orders from Odoo,
+// (2) keep only those NOT yet in the Decocoat file, (3) fill the Order Form for
+// them (colours parsed from the Odoo line description), (4) build an updated
+// Decocoat file = existing rows + the new ones appended.
+
+// Order Form column layout, taken from the real "Order book" sheet sent to Deco Coat.
+const ORDER_FORM_HEADERS = ['Prod Week','PO#','SO#','Bike SKU','Configuration','Quantity','Status',
+  'Main Frame custom color','Main frame finish effect','Rear frame custom color','Rear frame finish effect',
+  'Ahooga Logo color','Ahooga Logo Size','Personal Text','Color number','Primer','Color number/primer2','Primer2','Logo'];
+
+// Base SO number, e.g. "S23684 (1/2)" -> "S23684"
+function baseSO(s){ return (s||'').split('(')[0].trim().split(' ')[0].trim(); }
+
+// All custom-colour orders held in the planner (from Odoo), not yet shipped.
+function currentCustomOrders(){
+  return [...orders,...manualOrders]
+    .filter(o => o.color === 'custom' && o.status !== 'shipped')
+    .sort((a,b) => (a.priority||0) - (b.priority||0));
+}
+
+// Set of base SO numbers already present in the synced Decocoat file.
+function decocoatSOset(){
+  const set = new Set();
+  for(const d of (decocoatData||[])){ const b = baseSO(d.so); if(b) set.add(b); }
+  return set;
+}
+
+// Custom orders from Odoo that are NOT yet in the Decocoat file — the ones to order.
+function newCustomOrders(){
+  const have = decocoatSOset();
+  return currentCustomOrders().filter(o => !have.has(baseSO(o.name)));
+}
+
+// Resolve an order's configuration text in a version-tolerant way: prefer the Odoo
+// line description (o.config / o.configuration), and fall back to a matching row in
+// the synced Decocoat file. This lets the feature work whether or not the running
+// version of syncOdoo captures the line description.
+function orderConfig(o){
+  if(o && o.config) return o.config;
+  if(o && o.configuration) return o.configuration;
+  const b = baseSO(o && o.name);
+  const d = (decocoatData||[]).find(x => baseSO(x.so) === b);
+  return d ? (d.config || '') : '';
+}
+function orderMainColor(o, parsed){
+  if(parsed && parsed.mainColor) return parsed.mainColor;
+  const b = baseSO(o && o.name);
+  const d = (decocoatData||[]).find(x => baseSO(x.so) === b);
+  return d ? (d.colorName || '') : '';
+}
+
+// Parse the colour spec out of an Odoo line description / configuration string.
+// Handles patterns like "Main: Nightfall Blue (Matte)" and "Rear: Bay Breeze Blue (Glossy)",
+// plus "Logo: Atomium Grey", "Logo size: Small", "Text: ...". Degrades gracefully.
+function parseConfig(text){
+  const t = (text||'').replace(/\s+/g,' ').trim();
+  const r = { mainColor:'', mainFinish:'', rearColor:'', rearFinish:'', logoColor:'', logoSize:'', personalText:'' };
+  if(!t) return r;
+  const grab = (re) => { const m = t.match(re); return m ? m[1].trim() : ''; };
+  const colFinish = (label) => {
+    const m = t.match(new RegExp(label+'\\s*[:\\-]?\\s*([^\\(/|,;]+?)\\s*\\(([^\\)]+)\\)','i'));
+    if(m) return [m[1].trim(), m[2].trim()];
+    const m2 = t.match(new RegExp(label+'\\s*[:\\-]\\s*([^/|,;]+)','i'));
+    return m2 ? [m2[1].trim(),''] : ['',''];
+  };
+  [r.mainColor, r.mainFinish] = colFinish('Main(?:\\s*frame)?');
+  [r.rearColor, r.rearFinish] = colFinish('Rear(?:\\s*frame)?');
+  r.logoColor   = grab(/Logo(?:\s*colou?r)?\s*[:\-]\s*([^/|,;\(]+)/i);
+  r.logoSize    = grab(/Logo\s*size\s*[:\-]\s*([^/|,;\(]+)/i) || grab(/\b(Small|Medium|Large)\b/i);
+  r.personalText= grab(/(?:Personal\s*)?Text\s*[:\-]\s*([^/|]+)/i);
+  // If nothing matched but there is a single colour-looking string, use it as main colour.
+  if(!r.mainColor && t && !/[:]/.test(t)) r.mainColor = t;
+  return r;
+}
+
+// Map one planner order -> one Order Form row (array matching ORDER_FORM_HEADERS).
+function orderToFormRow(o){
+  const cfgText = orderConfig(o);
+  const c = parseConfig(cfgText);
+  return [
+    '',                          // Prod Week — Deco Coat confirms
+    o.poRef || '',               // PO#
+    o.name || '',                // SO#
+    o.sku || '',                 // Bike SKU
+    cfgText || '',               // Configuration (from Odoo, or Decocoat fallback)
+    1,                           // Quantity
+    '1- Order',                  // Status
+    orderMainColor(o, c),        // Main Frame custom color
+    c.mainFinish,                // Main frame finish effect
+    c.rearColor,                 // Rear frame custom color
+    c.rearFinish,                // Rear frame finish effect
+    c.logoColor,                 // Ahooga Logo color
+    c.logoSize,                  // Ahooga Logo Size
+    c.personalText,              // Personal Text
+    '', '',                      // Color number / Primer — paint-supplier lookup, left blank
+    '', '',                      // Color number 2 / Primer 2
+    ''                           // Logo
+  ];
+}
+
+function formsAlert(msg, kind){
+  const el = document.getElementById('forms-alert');
+  if(!el){ alert(msg); return; }
+  el.innerHTML = `<div class="alert alert-${kind||'success'}" style="margin:0">${msg}</div>`;
+  if((kind||'success')==='success') setTimeout(()=>{ el.innerHTML=''; }, 6000);
+}
+
+// Order Form sent to Deco Coat — ONLY orders not yet in the Decocoat file.
+// pass blank=true for an empty template, all=true to include every custom order.
+function exportOrderForm(opts){
+  opts = opts || {};
+  if(typeof XLSX === 'undefined'){ formsAlert('Excel library still loading — try again in a second.','warn'); return; }
+  const rows = opts.blank ? [] : (opts.all ? currentCustomOrders() : newCustomOrders());
+
+  if(!opts.blank && !rows.length){
+    const total = currentCustomOrders().length;
+    formsAlert(total
+      ? `All ${total} custom-colour order(s) are already in the Decocoat file — nothing new to order. (Use “All custom orders” to export them anyway.)`
+      : 'No custom-colour orders found. Sync Odoo first.', 'warn');
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0,10);
+  // Mirror the real file: blank col A, "Date:" in B1, header on row 3, data from row 4.
+  const aoa = [['', 'Date:', today], [], ['', ...ORDER_FORM_HEADERS]];
+  for(const o of rows) aoa.push(['', ...orderToFormRow(o)]);
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [{wch:2},{wch:10},{wch:9},{wch:14},{wch:30},{wch:36},{wch:8},{wch:9},
+    {wch:20},{wch:14},{wch:20},{wch:14},{wch:16},{wch:12},{wch:14},{wch:18},{wch:10},{wch:18},{wch:10},{wch:18}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Order book');
+  const fname = opts.blank ? 'Order form - TEMPLATE.xlsx' : `${today.replace(/-/g,'')} - New order.xlsx`;
+  XLSX.writeFile(wb, fname);
+  if(!opts.blank){
+    const skipped = currentCustomOrders().length - rows.length;
+    formsAlert(`Order Form downloaded · ${rows.length} new frame(s) pre-filled${skipped>0&&!opts.all?` · ${skipped} already in Decocoat skipped`:''}.`);
+  } else formsAlert('Blank Order Form template downloaded.');
+}
+
+// Updated Decocoat file = the existing synced rows + the new Odoo orders appended.
+// Columns follow the Decocoat order-book layout used by the sync.
+function exportUpdatedDecocoat(){
+  if(typeof XLSX === 'undefined'){ formsAlert('Excel library still loading — try again in a second.','warn'); return; }
+  const fresh = newCustomOrders();
+  const existing = decocoatData || [];
+  if(!existing.length && !fresh.length){ formsAlert('Nothing to write. Sync Odoo (and Decocoat) first.','warn'); return; }
+
+  const headers = ['SO#','PO#','Customer','Bike SKU','Configuration','Main Frame custom color',
+    'Status','Expected readiness date at Decocoat','arrival date at VV','Bike ID','Source'];
+  const aoa = [headers];
+
+  // Keep what is already in the Decocoat file as-is.
+  for(const d of existing){
+    aoa.push([ d.so||'', d.poRef||'', d.customer||'', d.sku||'', d.config||'', d.colorName||'',
+      d.status||'', d.decocoatReady||'', d.arrivalAtVV||'', d.bikeId||'', 'existing' ]);
+  }
+  // Append the new orders pulled from Odoo.
+  for(const o of fresh){
+    const cfgText = orderConfig(o);
+    const c = parseConfig(cfgText);
+    aoa.push([ o.name||'', o.poRef||'', o.customer||'', o.sku||'', cfgText||'', orderMainColor(o,c)||'',
+      '1- Order', '', '', '', 'NEW (from Odoo)' ]);
+  }
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [{wch:14},{wch:10},{wch:22},{wch:16},{wch:32},{wch:18},{wch:10},{wch:24},{wch:18},{wch:16},{wch:14}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Order book');
+  const today = new Date().toISOString().slice(0,10);
+  XLSX.writeFile(wb, `${today.replace(/-/g,'')} - Decocoat order book (updated).xlsx`);
+  formsAlert(`Updated Decocoat file downloaded · ${existing.length} existing + ${fresh.length} new row(s). Paste the new rows into the master Decocoat sheet.`);
 }
 
 // ─── INIT ─────────────────────────────────────────────────
