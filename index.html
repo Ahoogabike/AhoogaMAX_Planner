@@ -260,7 +260,7 @@ main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
   <div class="view" id="view-po">
     <div class="section-header">
       <h2>Weekly Production Schedule</h2>
-      <span class="section-label">auto-proposed every Monday · confirm to lock in</span>
+      <span class="section-label">nets out issued POs · proposes only what's still uncovered · confirm to lock in</span>
       <button class="btn btn-primary" onclick="proposeSchedule()">⚡ Propose this week</button>
       <button class="btn btn-secondary btn-sm" onclick="openRegisterPO()">+ Register existing PO</button>
       <button class="btn btn-secondary btn-sm" onclick="renderPOList()">↻ Refresh</button>
@@ -541,6 +541,7 @@ let visibleCols = {
 let manualOrders = []; // Virtual orders (e.g. Matt Cooke reservations)
 let decocoatData = [];
 let vvStock = [];
+let issuedPOSupply = []; // remaining-to-receive on every open purchase order for bikes (mirrors the Coming Next app)
 let lotToPOMap = {};
 let okaziByProduct = {}; // serial -> PO name // bikes at VV assembly with predicted serials // {so, bikeId, sku, status, arrivalAtVV, estimatedWarehouse, poRef, color, config}
 
@@ -1295,6 +1296,13 @@ async function syncOdoo() {
 
 
 
+    // ── Step 2b: ACCOUNT FOR ALL ISSUED PURCHASE ORDERS ──────────────────
+    // Authoritative supply = remaining-to-receive on every open PO for bikes,
+    // using the SAME rules as the "Bikes Coming Next" app. Covers the sales
+    // orders those POs already fulfil so the weekly proposal only suggests an
+    // ADDITIONAL PO for whatever sales orders are still left uncovered.
+    await accountForIssuedPOs();
+
     // ── Step 3: Register tracked Okazi POs into local poList ─────────────
     for(const po of okaziPOs){
       const poName = po.name;
@@ -1828,6 +1836,137 @@ function nextMondays(count) {
   return result;
 }
 
+async function accountForIssuedPOs() {
+  // Single source of truth for issued-PO supply — mirrors the "Bikes Coming
+  // Next" app EXACTLY so both apps reach the same result:
+  //   • scope: Bikes-category products whose name contains "MAX"
+  //   • remaining = round(qty ordered − qty received) on open POs (purchase/done)
+  //   • expected arrival = the PO line's date_planned (not order date + lead time)
+  //   • the same shared "won't arrive" exclusions are subtracted
+  // This does NOT depend on cfg.trackedPOs, so freshly-issued POs are
+  // recognised automatically and won't be re-proposed.
+  issuedPOSupply = [];
+  const toArr = v => Array.isArray(v) ? v : (v ? [v] : []);
+
+  // Shared "won't arrive" exclusions written by the Coming Next app
+  // (purchase.order.line id -> units excluded). Read from the SAME KV store
+  // and path the Coming Next app uses (/kv/), not the planner's /store/ path.
+  let excludedMap = {};
+  try {
+    const r = await fetch(`${CF_WORKER_URL}/kv/${encodeURIComponent('bikes_coming_excluded')}`);
+    if(r.ok){ const t=(await r.text()||'').trim(); if(t){ const o=JSON.parse(t); if(o&&typeof o==='object') excludedMap=o; } }
+  } catch(e){ console.warn('Shared exclusions read failed:', e.message); }
+
+  try {
+    // Bike category ids — same rule as Coming Next (complete_name starts "Bikes")
+    const cats = toArr(await odooCall('product.category','search_read',
+      [[['complete_name','ilike','Bikes']]], {fields:['id','complete_name'],limit:100}));
+    let bikeCatIds = cats.filter(c=>String(c.complete_name||'').startsWith('Bikes')).map(c=>c.id);
+    if(!bikeCatIds.length) bikeCatIds = cats.map(c=>c.id);
+
+    // Open MAX bike PO lines, ordered but not fully received — same domain & order
+    const lines = bikeCatIds.length ? toArr(await odooCall('purchase.order.line','search_read',
+      [[['order_id.state','in',['purchase','done']],['product_id.categ_id','in',bikeCatIds],['product_id.name','ilike','MAX']]],
+      {fields:['id','order_id','product_id','product_qty','qty_received','date_planned'],limit:20000,order:'date_planned asc'})) : [];
+
+    const poIds = [...new Set(lines.map(l=>toArr(l.order_id)[0]).filter(Boolean))];
+    const poHeaders = poIds.length ? toArr(await odooCall('purchase.order','search_read',
+      [[['id','in',poIds]]], {fields:['name','state'],limit:5000})) : [];
+    const poById = {}; poHeaders.forEach(p=>poById[p.id]=p);
+
+    for(const l of lines){
+      const po = poById[toArr(l.order_id)[0]];
+      if(!po || po.state==='cancel') continue;
+      const remaining = Math.round((parseFloat(l.product_qty)||0) - (parseFloat(l.qty_received)||0));
+      if(remaining<=0) continue;
+      const excluded = Math.min(remaining, excludedMap[l.id] || excludedMap[String(l.id)] || 0);
+      const eff = remaining - excluded;
+      if(eff<=0) continue;
+      const pname = toArr(l.product_id)[1]||'';
+      const expected = l.date_planned ? l.date_planned.split(' ')[0] : null;
+      issuedPOSupply.push({
+        lineId: l.id,
+        poName: po.name,
+        productId: toArr(l.product_id)[0],
+        sku: pname,
+        color: detectColor(pname),
+        transmission: detectTransmission(pname),
+        bikeType: detectBikeType(pname),
+        rack: detectRack(pname),
+        remaining: eff,
+        expectedArrival: expected
+      });
+    }
+  } catch(e){
+    console.warn('Issued-PO supply read failed:', e.message);
+    issuedPOSupply = [];
+    return;
+  }
+
+  // 1) Avoid double-counting: subtract supply already consumed by orders that
+  //    were matched to these POs earlier (vvStock / Register PO / confirmed).
+  for(const o of [...orders,...manualOrders]){
+    if(o.status==='inprod' && o.poRef){
+      const m = issuedPOSupply.find(s=>s.poName===o.poRef && s.remaining>0 &&
+        (String(s.productId)===String(o.productId) || s.sku===o.sku));
+      if(m) m.remaining--;
+    }
+  }
+
+  // 2) Cover the still-queued sales orders against the leftover issued-PO
+  //    supply (most urgent / earliest deadline first), matching by product
+  //    first then by bike attributes. These orders move to "inprod" and are
+  //    therefore excluded from the weekly proposal.
+  const queued = [...orders,...manualOrders]
+    .filter(o=>o.status==='queued')
+    .sort((a,b)=>{
+      if(a.isUrgent!==b.isUrgent) return a.isUrgent?-1:1;
+      if(a.deadline&&b.deadline) return new Date(a.deadline)-new Date(b.deadline);
+      if(a.deadline) return -1; if(b.deadline) return 1;
+      return a.priority-b.priority;
+    });
+  for(const o of queued){
+    const m = issuedPOSupply.find(s=>s.remaining>0 && (
+      String(s.productId)===String(o.productId) ||
+      (s.color===o.color && s.transmission===o.transmission && s.bikeType===o.bikeType && s.rack===o.rack)
+    ));
+    if(m){
+      o.status='inprod';
+      o.poRef=m.poName;
+      o.coveredByIssuedPO=true;
+      o.estimatedDelivery = m.expectedArrival || o.estimatedDelivery;
+      m.remaining--;
+    }
+  }
+
+  // 3) Surface issued POs that cover orders in the PO list (so they're visible
+  //    even when not in the tracked list / have no receipt yet).
+  const covering = {};
+  for(const o of [...orders,...manualOrders]){
+    if(o.coveredByIssuedPO && o.poRef){
+      (covering[o.poRef] = covering[o.poRef] || []).push(o.id);
+    }
+  }
+  for(const [ref, orderIds] of Object.entries(covering)){
+    if(poList.find(p=>p.ref===ref)) continue;
+    const supplyItem = issuedPOSupply.find(s=>s.poName===ref);
+    const famOrders = [...orders,...manualOrders].filter(o=>o.poRef===ref);
+    const fams = [...new Set(famOrders.map(transmissionFamily))];
+    poList.push({
+      ref,
+      week: supplyItem ? supplyItem.expectedArrival : null,
+      fam: fams[0] || 'unknown',
+      createdAt: null,
+      orderIds,
+      families: fams,
+      expectedArrival: supplyItem ? supplyItem.expectedArrival : null,
+      confirmed: true,
+      fromOdoo: true,
+      issuedPO: true
+    });
+  }
+}
+
 function buildRollingSchedule() {
   // Build a 6-week rolling production plan for ALL queued orders
   // Returns: array of week plans [{week, proposals:[{fam, orders, customOrders, expectedArrival}]}]
@@ -1929,8 +2068,11 @@ function proposeSchedule() {
   const weekPlans = buildRollingSchedule();
 
   if(!weekPlans.length){
+    const coveredCnt = [...orders,...manualOrders].filter(o=>o.coveredByIssuedPO).length;
     document.getElementById('schedule-proposal').innerHTML =
-      '<div class="alert alert-info">No queued orders to schedule.</div>';
+      coveredCnt>0
+        ? `<div class="alert alert-success">✓ Every queued sales order is already covered by issued purchase orders (${coveredCnt} bike${coveredCnt===1?'':'s'} on existing POs). No additional PO needed right now.</div>`
+        : '<div class="alert alert-info">No queued orders to schedule.</div>';
     return;
   }
 
@@ -1959,7 +2101,23 @@ function renderProposal(proposals) {
   const el = document.getElementById('schedule-proposal');
   if(!proposals.length){ el.innerHTML=''; return; }
 
+  // Coverage summary: how many sales orders are already on issued POs vs. how
+  // many this proposal (the "additional PO") still needs to order.
+  const coveredOrders = [...orders,...manualOrders].filter(o=>o.coveredByIssuedPO);
+  const coveredCnt = coveredOrders.length;
+  const coveredPORefs = [...new Set(coveredOrders.map(o=>o.poRef).filter(Boolean))];
+  const toOrderNow = proposals.reduce((s,p)=>s+p.orders.length+p.customOrders.length,0);
+  const coverageBanner = coveredCnt>0 ? `
+    <div class="alert alert-success" style="margin-bottom:12px;line-height:1.5">
+      ✓ <strong>${coveredCnt} sales-order bike${coveredCnt===1?'':'s'}</strong> already covered by issued PO${coveredPORefs.length===1?'':'s'}${coveredPORefs.length?` (${coveredPORefs.join(', ')})`:''} — excluded below.
+      The proposal is an <strong>additional PO for the ${toOrderNow} still-uncovered order${toOrderNow===1?'':'s'}</strong> this week.
+    </div>` : `
+    <div class="alert alert-info" style="margin-bottom:12px">
+      No issued POs currently cover queued orders — proposing for all ${toOrderNow} uncovered order${toOrderNow===1?'':'s'} this week.
+    </div>`;
+
   const html = `
+    ${coverageBanner}
     <div style="background:var(--accent-bg);border:1px solid rgba(26,79,160,0.2);border-radius:var(--radius);padding:16px 20px;margin-bottom:16px">
       <div style="font-weight:600;font-size:14px;color:var(--accent-text);margin-bottom:4px">
         📋 Proposed production schedule for ${getWeekLabel(proposals[0].week)}
@@ -2105,8 +2263,13 @@ function renderPOList() {
   const el=document.getElementById('po-list');
   if(!el) return;
 
-  // Only show POs that still have bikes at VV assembly (unvalidated receipts)
-  const activePOList = poList.filter(po=>vvStock.some(i=>i.poName===po.ref));
+  // Show POs that still have bikes at VV assembly (unvalidated receipts) OR
+  // that cover queued sales orders via an issued PO (recognised automatically).
+  const activePOList = poList.filter(po=>
+    vvStock.some(i=>i.poName===po.ref) ||
+    po.issuedPO ||
+    [...orders,...manualOrders].some(o=>o.poRef===po.ref && o.coveredByIssuedPO)
+  );
 
   if(!activePOList.length){
     el.innerHTML=`<div class="section-header"><h2>Confirmed POs · At VV Assembly</h2></div>
@@ -2534,8 +2697,11 @@ function renderStockSummary(el) {
           const serialRange = matchItems.map(i=>i.serialRange).filter(Boolean).join(', ');
           const serial = serialRange ? `<br><span style="font-family:monospace;font-size:10px;color:var(--text3)">${serialRange}</span>` : '';
           const freeTag = unassigned>0 ? `<br><span style="font-size:10px;color:var(--success);font-weight:600">+${unassigned} free</span>` : '';
+          // PO reference(s) feeding these specific bikes
+          const cellPOs = [...new Set(matchItems.map(i=>i.poName).filter(Boolean))].join(', ');
+          const poTag = cellPOs ? `<br><span style="font-size:9px;color:var(--purple);font-weight:600;letter-spacing:0.02em">${cellPOs}</span>` : '';
           return `<td style="text-align:center;font-size:15px;font-weight:700;color:var(--purple);padding:6px 8px;vertical-align:middle">
-            ${total}${serial}${freeTag}
+            ${total}${serial}${poTag}${freeTag}
           </td>`;
         }).join('');
         return `<tr><td style="font-size:12px;color:var(--text2);white-space:nowrap;padding:6px 10px">${rack==='rack'?'With rack':'No rack'}</td>${cells}</tr>`;
