@@ -1348,10 +1348,11 @@ async function syncOdoo() {
     // If stock tab was active, refresh it now that vvStock is populated
     if(currentStockTab==='summary') renderStock();
     renderPOList();
-    const today=new Date();
     // PO building now lives in the standalone "PO Builder — Bikes" app.
     // The rolling schedule still runs above (assignPredictedDeliveries) to set
-    // predicted delivery dates on the queue.
+    // predicted delivery dates on the queue. Publish the supply/demand basis so
+    // the PO Builder can compute production = unmatched orders + (forecast − surplus stock).
+    publishProductionBasis();
   } catch(e){ alert('Sync error: '+e.message); }
 }
 
@@ -2075,6 +2076,38 @@ function getFreeStockCounts(){
     add(`${item.bikeType}_${item.transmission}`, item.color, item.rack, Math.max(0, item.qty - assigned));
   }
   return map;
+}
+
+// Publish a per-SKU production basis to the shared store for the PO Builder app.
+//   unmatchedBySku  = open orders still needing production (queued/hold) — stock &
+//                     incoming POs are already netted out via the matcher's statuses.
+//   freeStockBySku  = surplus free stock (unreserved, unassigned) that can absorb forecast.
+// SKU key format: bikeType|transmission|color|rack  (e.g. emax|alfine|yellow|rack)
+function publishProductionBasis(){
+  try{
+    const unmatchedBySku={}, freeStockBySku={}, incomingBySku={}, inprodBySku={};
+    for(const o of [...orders, ...manualOrders]){
+      if(!o.bikeType || !o.transmission) continue;
+      const k=`${o.bikeType}|${o.transmission}|${o.color}|${o.rack}`;
+      if(o.status==='queued'||o.status==='hold') unmatchedBySku[k]=(unmatchedBySku[k]||0)+1;
+      else if(o.status==='inprod')               inprodBySku[k]=(inprodBySku[k]||0)+1;
+    }
+    const fsc=getFreeStockCounts();   // keys: fam|color|rack with fam = bikeType_transmission
+    for(const [key,n] of Object.entries(fsc)){
+      const parts=key.split('|'); const fam=parts[0]||''; const color=parts[1], rack=parts[2];
+      const us=fam.lastIndexOf('_'); if(us<0) continue;
+      const bt=fam.slice(0,us), tr=fam.slice(us+1);
+      const k=`${bt}|${tr}|${color}|${rack}`;
+      freeStockBySku[k]=(freeStockBySku[k]||0)+n;
+    }
+    // remaining-to-receive on every open PO (same data as the Bikes Coming Next app)
+    for(const s of issuedPOSupply){
+      if(!s.bikeType || !s.transmission) continue;
+      const k=`${s.bikeType}|${s.transmission}|${s.color}|${s.rack}`;
+      incomingBySku[k]=(incomingBySku[k]||0)+(s.remaining||0);
+    }
+    kvSet('production_basis', { unmatchedBySku, freeStockBySku, incomingBySku, inprodBySku, year:new Date().getFullYear(), updated:new Date().toISOString() });
+  }catch(e){ console.warn('publishProductionBasis failed', e); }
 }
 
 function buildRollingSchedule() {
