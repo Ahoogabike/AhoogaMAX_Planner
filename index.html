@@ -163,7 +163,6 @@ main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
   <div class="logo">MAX <span>Planner</span></div>
   <nav>
     <button class="nav-btn active" onclick="showView('queue')">Production Queue</button>
-    <button class="nav-btn" onclick="showView('po')">PO Builder</button>
     <button class="nav-btn" onclick="showView('stock')">Stock</button>
     <button class="nav-btn" onclick="showView('serials')">Serials</button>
     <button class="nav-btn" onclick="showView('custom')">Custom Colors</button>
@@ -195,7 +194,7 @@ main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
       <button class="btn btn-secondary btn-sm" onclick="toggleColPanel()">⚙ Columns</button>
       <button class="btn btn-secondary btn-sm" onclick="openAddManualOrder()">+ Manual reservation</button>
       <button class="btn btn-danger btn-sm" onclick="openHoldModal()">⏸ Hold order</button>
-      <button class="btn btn-primary btn-sm" onclick="showView('po')">Build next PO →</button>
+      <button class="btn btn-primary btn-sm" onclick="window.open('https://ahoogabike.github.io/po-builder-bikes.html','_blank')">Build next PO ↗</button>
     </div>
 
     <div id="col-panel" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;margin-bottom:12px;flex-wrap:wrap;gap:10px">
@@ -1350,7 +1349,9 @@ async function syncOdoo() {
     if(currentStockTab==='summary') renderStock();
     renderPOList();
     const today=new Date();
-    if(today.getDay()===1) setTimeout(()=>{ showView('po'); proposeSchedule(); },500);
+    // PO building now lives in the standalone "PO Builder — Bikes" app.
+    // The rolling schedule still runs above (assignPredictedDeliveries) to set
+    // predicted delivery dates on the queue.
   } catch(e){ alert('Sync error: '+e.message); }
 }
 
@@ -2265,7 +2266,26 @@ function assignPredictedDeliveries() {
   }
 }
 
-function proposeSchedule() {
+// Pull just the latest published Sales Forecast (cheap KV read) and fold it
+// into forecastMix, so a proposal always reflects the newest forecast even if
+// it was published after the planner finished its Odoo sync. Safe to call any
+// time: if nothing is published, or we're offline, forecastMix is left as-is.
+async function refreshForecastFromApp() {
+  if(!IS_ONLINE) return;
+  try {
+    const fc = await kvGet('sales_forecast');
+    if(fc && fc.forwardBySku && typeof fc.forwardBySku==='object') {
+      forecastMix = forecastMix || { color:{yellow:0,black:0,red:0}, rack:{'rack':0,'no rack':0}, model:{} };
+      forecastMix.bySku = fc.forwardBySku;
+      forecastMix.fcYear = fc.year;
+      forecastMix.fcUpdated = fc.updated;
+      forecastMix.source = 'sales-forecast.html';
+    }
+  } catch(e) { console.warn('refreshForecastFromApp failed:', e.message); }
+}
+
+async function proposeSchedule() {
+  await refreshForecastFromApp();   // always build from the freshest forecast
   const weekPlans = buildRollingSchedule();
 
   if(!weekPlans.length){
