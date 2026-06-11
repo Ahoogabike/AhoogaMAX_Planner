@@ -178,6 +178,7 @@ main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
     <button class="btn btn-secondary btn-sm" onclick="syncOdoo()">↻ Sync</button>
   </div>
 </header>
+<div id="pallet-banner" style="display:none"></div>
 
 <main>
 
@@ -567,6 +568,18 @@ main{flex:1;padding:24px;max-width:1400px;margin:0 auto;width:100%}
   </div>
 </div>
 
+<!-- PALLETS MODAL -->
+<div class="modal-backdrop" id="modal-pallets" onclick="if(event.target===this)closeModal('modal-pallets')">
+  <div class="modal" style="max-width:560px">
+    <h2>📦 Pallets from Matt</h2>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Each pallet is 6 bikes. They auto-retire when a matching sales order is detected on the next Odoo sync; use “Mark as ordered” if you created the SO and it wasn’t matched automatically.</p>
+    <div id="pallets-body" style="max-height:60vh;overflow-y:auto"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('modal-pallets')">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ─── STATE ───────────────────────────────────────────────
 let cfg = {
@@ -600,6 +613,7 @@ let visibleCols = {
   predicted: true, po: true
 };
 let manualOrders = []; // Virtual orders (e.g. Matt Cooke reservations)
+let pallets = []; // Matt Cooke shipment pallets (6 bikes each), shared via KV (key: shared_pallets)
 let decocoatData = [];
 let vvStock = [];
 let issuedPOSupply = []; // remaining-to-receive on every open purchase order for bikes (mirrors the Coming Next app)
@@ -746,14 +760,26 @@ async function loadSharedState() {
       }
     }
 
-    // Load shared manual reservations
+    // Load shared manual reservations (two-way sync with Matt Cooke's page).
+    // KV `shared_manual` is the source of truth for manual reservations: add new ones,
+    // pull edits into the user-editable fields (keep our computed status/serial/priority),
+    // and drop ones deleted remotely.
     const sharedManual = await kvGet('shared_manual');
     if(sharedManual && Array.isArray(sharedManual)) {
-      // Merge: add manual orders not already in local list
+      const USERF=['customer','sku','color','transmission','bikeType','rack','qty','deadline','scheduledDate','notes'];
+      const ids=new Set(sharedManual.map(m=>m.id));
       for(const m of sharedManual) {
-        if(!manualOrders.find(x=>x.id===m.id)) manualOrders.push(m);
+        const ex=manualOrders.find(x=>x.id===m.id);
+        if(!ex) manualOrders.push(m);
+        else USERF.forEach(k=>{ if(m[k]!==undefined) ex[k]=m[k]; });
       }
+      // honour remote deletions (manual reservations only)
+      for(let i=manualOrders.length-1;i>=0;i--){ if(manualOrders[i].isManual && !ids.has(manualOrders[i].id)) manualOrders.splice(i,1); }
     }
+
+    // Load shared pallets (built in Matt Cooke's page)
+    const sharedPallets = await kvGet('shared_pallets');
+    if(sharedPallets && Array.isArray(sharedPallets)) pallets = sharedPallets;
 
     // Load shared priorities
     const sharedPrio = await kvGet('shared_priorities');
@@ -768,6 +794,7 @@ async function loadSharedState() {
     const sharedSerials = await kvGet('shared_serials');
     if(sharedSerials && typeof sharedSerials === 'object') serialAssignments = sharedSerials;
 
+    try{ renderPalletBanner(); }catch(e){}
     console.log('[KV] Shared state loaded');
   } catch(e) { console.warn('loadSharedState failed:', e); }
 }
@@ -790,6 +817,7 @@ async function saveSharedState() {
 
     // Save manual reservations
     await kvSet('shared_manual', manualOrders);
+    await kvSet('shared_pallets', pallets);
 
     // Save priority overrides (only non-default)
     const allSorted = [...orders,...manualOrders].filter(x=>x.status!=='shipped').sort((a,b)=>a.priority-b.priority);
@@ -800,6 +828,7 @@ async function saveSharedState() {
     // Save custom-frame serial assignments
     await kvSet('shared_serials', serialAssignments);
 
+    publishStockMirror();
     console.log('[KV] Shared state saved');
   } catch(e) { console.warn('saveSharedState failed:', e); }
 }
@@ -1585,6 +1614,9 @@ async function syncOdoo() {
     // predicted delivery dates on the queue. Publish the supply/demand basis so
     // the PO Builder can compute production = unmatched orders + (forecast − surplus stock).
     publishProductionBasis();
+    publishStockMirror();
+    reconcilePallets();
+    renderPalletBanner();
   } catch(e){ alert('Sync error: '+e.message); }
 }
 
@@ -2350,6 +2382,88 @@ function publishProductionBasis(){
     }
     kvSet('production_basis', { unmatchedBySku, freeStockBySku, incomingBySku, inprodBySku, year:new Date().getFullYear(), updated:new Date().toISOString() });
   }catch(e){ console.warn('publishProductionBasis failed', e); }
+}
+
+// Publish a read-only snapshot of physical stock so the Matt Cooke page can mirror availability.
+function publishStockMirror(){
+  try{
+    const items=(stock||[]).map(s=>({
+      serial:s.serial||'', sku:s.sku||'', color:s.color||'', transmission:s.transmission||'',
+      bikeType:s.bikeType||'', rack:s.rack||'', dateArrived:s.dateArrived||null,
+      location:s.location||'', inTransit:!!s.inTransit, reserved:!!s.reservedFor,
+      expectedArrival:s.expectedArrival||null
+    }));
+    kvSet('shared_stock_mirror', { updated:new Date().toISOString(), stock:items });
+  }catch(e){ console.warn('publishStockMirror failed', e); }
+}
+
+/* ───────── Matt Cooke pallets (6-bike shipments) ───────── */
+function pe(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function palletBikeLabel(it){
+  const T={amax:'A-MAX',emax:'E-MAX'},R={alfine:'Alfine',derailleur:'Derailleur'},C={yellow:'Bumblebee Yellow',black:'Cosmic Black',red:'Ruby Red',custom:'Custom colour'};
+  return `${T[it.bikeType]||it.bikeType||''} ${R[it.transmission]||it.transmission||''} · ${C[it.color]||it.color||''}${it.rack==='no rack'?' (no rack)':' + rack'}`;
+}
+// Auto-retire: when a matching Matt-Cooke sales order appears in Odoo, retire the pallet's reservations.
+function reconcilePallets(){
+  if(!pallets||!pallets.length) return;
+  const realBySo={};
+  for(const o of orders){ if(o.isManual) continue; const c=(o.customer||''); if(!c) continue;
+    const rec=realBySo[o.name]=realBySo[o.name]||{customer:c,counts:{}};
+    const k=`${o.bikeType}|${o.transmission}|${o.color}|${o.rack}`;
+    rec.counts[k]=(rec.counts[k]||0)+1;
+  }
+  const usedSo=new Set(pallets.filter(p=>p.so).map(p=>p.so));
+  let changed=false;
+  for(const p of pallets){
+    if(p.status==='ordered') continue;
+    const need={}; (p.items||[]).forEach(it=>{ const k=`${it.bikeType}|${it.transmission}|${it.color}|${it.rack}`; need[k]=(need[k]||0)+1; });
+    for(const [soName,info] of Object.entries(realBySo)){
+      if(usedSo.has(soName)) continue;
+      const ca=(p.customer||'').toLowerCase(), cb=info.customer.toLowerCase();
+      if(!(ca===cb || (ca.includes('cooke')&&cb.includes('cooke')))) continue;
+      let ok=true; for(const k in need){ if((info.counts[k]||0)<need[k]){ ok=false; break; } }
+      if(ok){ p.status='ordered'; p.so=soName; p.orderedAt=new Date().toISOString(); usedSo.add(soName);
+        const rids=new Set(p.reservationIds||[]);
+        for(let i=manualOrders.length-1;i>=0;i--){ if(rids.has(manualOrders[i].id)) manualOrders.splice(i,1); }
+        changed=true; break;
+      }
+    }
+  }
+  if(changed){ try{ save(); }catch(e){} saveSharedState(); try{ renderQueue(); updateKPIs(); }catch(e){} }
+}
+function markPalletOrdered(id){
+  const p=(pallets||[]).find(x=>x.id===id); if(!p) return;
+  if(!confirm('Mark this pallet as ordered? Its '+((p.items||[]).length)+' reservation(s) will be retired (they become the Odoo sales order).')) return;
+  p.status='ordered'; p.so=p.so||'(manual)'; p.orderedAt=new Date().toISOString();
+  const rids=new Set(p.reservationIds||[]);
+  for(let i=manualOrders.length-1;i>=0;i--){ if(rids.has(manualOrders[i].id)) manualOrders.splice(i,1); }
+  try{ save(); }catch(e){} saveSharedState(); renderPalletBanner(); openPallets(); try{ renderQueue(); updateKPIs(); }catch(e){}
+}
+function renderPalletBanner(){
+  const el=document.getElementById('pallet-banner'); if(!el) return;
+  const pend=(pallets||[]).filter(p=>p.status!=='ordered');
+  if(!pend.length){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display='block';
+  el.innerHTML=`<div style="margin:12px 16px;padding:10px 14px;border-radius:8px;background:var(--accent-bg);border:1px solid var(--accent);color:var(--accent-text);font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span>📦 <b>${pend.length} pallet${pend.length>1?'s':''}</b> from Matt awaiting a sales order.</span><button class="btn btn-secondary btn-sm" onclick="openPallets()">View pallets</button></div>`;
+}
+function openPallets(){
+  const body=document.getElementById('pallets-body'); if(!body) return;
+  const list=(pallets||[]).slice().sort((a,b)=>((a.status==='ordered')-(b.status==='ordered')) || String(b.createdAt||'').localeCompare(String(a.createdAt||'')));
+  if(!list.length){ body.innerHTML='<div class="empty">No pallets yet.</div>'; }
+  else body.innerHTML=list.map(p=>{
+    const bikes=(p.items||[]).map(it=>`<li>${pe(palletBikeLabel(it))}</li>`).join('');
+    const ordered=p.status==='ordered';
+    const meta=`${pe(p.customer||'')} · ${(p.items||[]).length} bikes · created ${fmtDate(p.createdAt)}`;
+    return `<div style="border:1px solid var(--border2);border-radius:8px;padding:12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+        <div><b>${pe(p.label||'Pallet')}</b> <span style="font-size:12px;color:var(--text3)">${meta}</span></div>
+        <div>${ordered?`<span class="badge badge-stock">Ordered${p.so&&p.so!=='(manual)'?' · '+pe(p.so):''}</span>`:`<button class="btn btn-success btn-sm" onclick="markPalletOrdered('${p.id}')">Mark as ordered (SO created)</button>`}</div>
+      </div>
+      <ul style="margin:8px 0 0 18px;font-size:13px;color:var(--text2)">${bikes}</ul>
+      ${p.note?`<div style="font-size:12px;color:var(--text3);margin-top:6px">📝 ${pe(p.note)}</div>`:''}
+    </div>`;
+  }).join('');
+  document.getElementById('modal-pallets').classList.add('open');
 }
 
 function buildRollingSchedule() {
