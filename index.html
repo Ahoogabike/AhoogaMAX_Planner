@@ -2451,7 +2451,7 @@ function openPallets(){
   const list=(pallets||[]).slice().sort((a,b)=>((a.status==='ordered')-(b.status==='ordered')) || String(b.createdAt||'').localeCompare(String(a.createdAt||'')));
   if(!list.length){ body.innerHTML='<div class="empty">No pallets yet.</div>'; }
   else body.innerHTML=list.map(p=>{
-    const bikes=(p.items||[]).map(it=>`<li>${pe(palletBikeLabel(it))}</li>`).join('');
+    const bikes=(p.items||[]).map(it=>`<li>${pe(palletBikeLabel(it))}${it.serial?' · '+pe(it.serial):''}</li>`).join('');
     const ordered=p.status==='ordered';
     const meta=`${pe(p.customer||'')} · ${(p.items||[]).length} bikes · created ${fmtDate(p.createdAt)}`;
     return `<div style="border:1px solid var(--border2);border-radius:8px;padding:12px;margin-bottom:10px">
